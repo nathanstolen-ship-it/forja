@@ -55,3 +55,6 @@ Abre em tela cheia, com ícone próprio.
 
 ## Backup dos dados
 Como o histórico vive no navegador, trocar de aparelho ou limpar dados apaga tudo. Se quiser sincronização entre dispositivos, dá pra trocar a camada de storage por Upstash Redis + uma serverless function em `/api` (mesmo padrão do Jaleco).
+
+## Créditos de dados
+As informações de execução dos exercícios (`src/data/exercicios.js`) foram derivadas do [exercises-dataset](https://github.com/) (MIT License, © 2026 Hasan Emir Yıldırım), com instruções traduzidas e adaptadas para pt-BR. Os GIFs de execução em `public/exercicios/` são © Gym Visual (gymvisual.com), redistribuídos em 180×180 com atribuição visível na interface, conforme o NOTICE.md do dataset. Para uso além desses termos, obtenha licença própria junto à Gym Visual.

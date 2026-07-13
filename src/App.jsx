@@ -2,8 +2,9 @@ import React, { useState, useEffect, useRef, useCallback } from "react";
 import {
   Dumbbell, Play, Check, Plus, Minus, Timer as TimerIcon, TrendingUp,
   ChevronLeft, History as HistoryIcon, ClipboardList, Flame, RotateCcw,
-  X, Award, Save, Pencil
+  X, Award, Save, Pencil, Info
 } from "lucide-react";
+import { EXERCICIOS_INFO, ATRIBUICAO_MIDIA } from "./data/exercicios.js";
 
 /* ============================ PLANO (16 semanas) ============================ */
 // type: "load" (carga×reps) | "time" (segundos) — inc = menor incremento de carga
@@ -212,6 +213,45 @@ async function saveKey(key, value) {
 }
 
 /* ============================ COMPONENTES ============================ */
+function ExInfoSheet({ exId, exName, onClose }) {
+  const info = EXERCICIOS_INFO[exId];
+  if (!info) return null;
+  return (
+    <div className="sheetOverlay" onClick={onClose}>
+      <div className="sheet" onClick={(e) => e.stopPropagation()}>
+        <div className="sheetHead">
+          <div>
+            <div className="sheetTitle">{exName}</div>
+            <div className="sheetSub">{info.equipamento}</div>
+          </div>
+          <button className="sheetClose" onClick={onClose} aria-label="Fechar"><X size={18} /></button>
+        </div>
+
+        <div className="sheetMuscles">
+          <span className="musclePill musclePillMain">{info.alvo}</span>
+          {info.secundarios.map((m) => <span key={m} className="musclePill">{m}</span>)}
+        </div>
+
+        {info.gif && (
+          <div className="sheetMedia">
+            <img src={info.gif} alt={`Demonstração: ${exName}`} loading="lazy" width="180" height="180" />
+            <span className="sheetCredit">{ATRIBUICAO_MIDIA}</span>
+          </div>
+        )}
+
+        <div className="sheetLabel">Execução</div>
+        <ol className="sheetSteps">
+          {info.passos.map((p, i) => <li key={i}>{p}</li>)}
+        </ol>
+
+        {info.dica && (
+          <div className="sheetTip"><Flame size={14} /> {info.dica}</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function Stepper({ value, onChange, step = 2.5, min = 0, suffix }) {
   const dec = () => onChange(Math.max(min, +(value - step).toFixed(2)));
   const inc = () => onChange(+(value + step).toFixed(2));
@@ -280,6 +320,7 @@ export default function App() {
   const [active, setActive] = useState(null); // { workout, entries }
   const [showTimer, setShowTimer] = useState(false);
   const [prToast, setPrToast] = useState(null);
+  const [infoEx, setInfoEx] = useState(null); // { id, name } — painel de execução
 
   useEffect(() => {
     (async () => {
@@ -544,6 +585,11 @@ export default function App() {
                         {ex.note ? ` · ${ex.note}` : ""}
                       </div>
                     </div>
+                    {EXERCICIOS_INFO[ex.id] && (
+                      <button className="infoBtn" onClick={() => setInfoEx({ id: ex.id, name: ex.name })} aria-label={`Como executar ${ex.name}`}>
+                        <Info size={16} />
+                      </button>
+                    )}
                   </div>
 
                   {last && (
@@ -663,7 +709,13 @@ export default function App() {
                   <div className="planExList">
                     {w.ex.map((ex) => (
                       <div key={ex.id} className="planExRow">
-                        <span className="planExName">{ex.name}</span>
+                        {EXERCICIOS_INFO[ex.id] ? (
+                          <button className="planExName planExLink" onClick={() => setInfoEx({ id: ex.id, name: ex.name })}>
+                            {ex.name} <Info size={12} />
+                          </button>
+                        ) : (
+                          <span className="planExName">{ex.name}</span>
+                        )}
                         <span className="planExScheme">{ex.type === "time" ? `${ex.sets} × tempo` : `${ex.sets} × ${ex.min}–${ex.max}`}</span>
                       </div>
                     ))}
@@ -685,6 +737,7 @@ export default function App() {
       )}
 
       {prToast && <div className="prToast"><Award size={16} /> {prToast}</div>}
+      {infoEx && <ExInfoSheet exId={infoEx.id} exName={infoEx.name} onClose={() => setInfoEx(null)} />}
     </div>
   );
 }
@@ -713,6 +766,41 @@ function VolumeChart({ sessions }) {
 /* ============================ ESTILO ============================ */
 const CSS = `
 @import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@500;700&display=swap');
+
+/* ---------- painel de execução (info) ---------- */
+.infoBtn{flex:0 0 auto;width:32px;height:32px;border:1px solid var(--line);background:var(--surface2);
+  color:var(--steel);border-radius:9px;display:grid;place-items:center;cursor:pointer;transition:.15s;}
+.infoBtn:hover{color:var(--text);border-color:var(--steel);}
+.planExLink{display:inline-flex;align-items:center;gap:5px;background:none;border:none;padding:0;
+  color:var(--text);font:inherit;cursor:pointer;text-align:left;}
+.planExLink svg{color:var(--steel);opacity:.7;}
+.planExLink:hover{color:var(--steel);}
+.sheetOverlay{position:fixed;inset:0;z-index:60;background:rgba(10,12,16,.6);backdrop-filter:blur(3px);
+  display:flex;align-items:flex-end;justify-content:center;animation:fadeIn .15s ease;}
+@keyframes fadeIn{from{opacity:0}to{opacity:1}}
+.sheet{width:100%;max-width:560px;max-height:82vh;overflow-y:auto;background:var(--surface);
+  border:1px solid var(--line);border-bottom:none;border-radius:20px 20px 0 0;padding:20px 18px 26px;
+  box-shadow:var(--shadow);animation:slideUp .2s ease;}
+@keyframes slideUp{from{transform:translateY(24px);opacity:.6}to{transform:translateY(0);opacity:1}}
+.sheetHead{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:14px;}
+.sheetTitle{font-family:'Barlow Condensed',sans-serif;font-weight:700;font-size:22px;letter-spacing:.02em;}
+.sheetSub{color:var(--muted);font-size:13px;margin-top:2px;}
+.sheetClose{flex:0 0 auto;width:34px;height:34px;border:1px solid var(--line);background:var(--surface2);
+  color:var(--muted);border-radius:10px;display:grid;place-items:center;cursor:pointer;}
+.sheetMuscles{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:16px;}
+.sheetMedia{display:flex;flex-direction:column;align-items:center;gap:6px;margin-bottom:16px;}
+.sheetMedia img{width:180px;height:180px;border-radius:14px;border:1px solid var(--line);background:#fff;}
+.sheetCredit{font-size:10px;color:var(--muted);letter-spacing:.03em;}
+.musclePill{font-size:12px;padding:4px 10px;border-radius:999px;border:1px solid var(--line);
+  background:var(--surface2);color:var(--muted);}
+.musclePillMain{border-color:var(--steel);color:var(--steel);background:rgba(110,147,184,.10);font-weight:600;}
+.sheetLabel{font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);margin-bottom:8px;}
+.sheetSteps{margin:0 0 16px;padding-left:20px;display:flex;flex-direction:column;gap:8px;}
+.sheetSteps li{font-size:14px;line-height:1.5;color:var(--text);}
+.sheetSteps li::marker{color:var(--steel);font-weight:600;}
+.sheetTip{display:flex;gap:8px;align-items:flex-start;font-size:13px;line-height:1.5;color:var(--ember);
+  background:rgba(230,169,70,.08);border:1px solid rgba(230,169,70,.25);border-radius:12px;padding:10px 12px;}
+.sheetTip svg{flex:0 0 auto;margin-top:2px;}
 
 :root{
   --ink:#101318; --surface:#191D25; --surface2:#20252F; --line:#2C3240;
