@@ -54,7 +54,7 @@ export const EXERCICIOS_INFO = {
     dica: "Peito alto, escápulas presas no banco. Quem se move é o braço, não o ombro.",
   },
   desenvmaq: {
-    srcId: "0603",
+    srcId: "0869",
     gif: "/exercicios/desenvmaq.gif",
     alvo: "Deltoides",
     secundarios: ["Tríceps", "Peitoral superior"],

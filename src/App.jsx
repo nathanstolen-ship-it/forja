@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from "react";
 import {
   Dumbbell, Play, Check, Plus, Minus, Timer as TimerIcon, TrendingUp,
   ChevronLeft, History as HistoryIcon, ClipboardList, Flame, RotateCcw,
-  X, Award, Save, Pencil, Info
+  X, Award, Save, Pencil, Info, Download, Upload
 } from "lucide-react";
 import { EXERCICIOS_INFO, ATRIBUICAO_MIDIA } from "./data/exercicios.js";
 
@@ -189,6 +189,9 @@ const returnFactor = (days) => {
   return 0.9;
 };
 // Reconstrói o "melhor registro" de cada exercício a partir das sessões que têm séries salvas.
+// Só treinos NOVOS marcados como não realizados (completed === false) são ignorados como
+// referência. Sessões antigas (sem o campo completed) contam exatamente como antes — a regra
+// não mexe retroativamente no histórico já registrado.
 function recomputePerf(sessions, base = {}) {
   const perf = { ...base };
   const asc = sessions.filter((s) => Array.isArray(s.entries)).sort((a, b) => new Date(a.date) - new Date(b.date));
@@ -196,6 +199,7 @@ function recomputePerf(sessions, base = {}) {
     const w = findWorkout(s.workoutId); if (!w) continue;
     s.entries.forEach((e) => {
       const ex = w.ex.find((x) => x.id === e.exId); if (!ex) return;
+      if (e.completed === false) return; // treino novo não realizado; histórico antigo não é afetado
       const reps = e.sets.map((st) => +st.reps || 0);
       const weight = ex.type === "time" ? 0 : (e.sets[0]?.weight || 0);
       const top = ex.type === "time" ? false : reps.length > 0 && reps.every((r) => r >= ex.max);
@@ -207,7 +211,8 @@ function recomputePerf(sessions, base = {}) {
 
 /* ============================ PERSISTÊNCIA ============================ */
 const KEY_STATE = "forja:state";     // { week }
-const KEY_LOG = "forja:log";         // { sessions: [], perf: {exId:{weight,reps[],top,date}} }
+const KEY_LOG = "forja:log";         // { sessions: [], perf: {exId:{weight,reps[],top,date}}, incs: {exId:kg} }
+const KEY_ACTIVE = "forja:active";   // rascunho do treino em andamento — { workoutId, entries, editingId, week }
 
 // Persistência via localStorage (por dispositivo/navegador). Mantidas como
 // funções async para não alterar o resto do app.
@@ -326,18 +331,22 @@ function RestTimer({ onClose }) {
 export default function App() {
   const [view, setView] = useState("home");
   const [week, setWeek] = useState(1);
-  const [log, setLog] = useState({ sessions: [], perf: {} });
+  const [log, setLog] = useState({ sessions: [], perf: {}, incs: {} });
   const [loading, setLoading] = useState(true);
   const [active, setActive] = useState(null); // { workout, entries }
   const [showTimer, setShowTimer] = useState(false);
   const [prToast, setPrToast] = useState(null);
   const [infoEx, setInfoEx] = useState(null); // { id, name } — painel de execução
   const [applyReturnReduction, setApplyReturnReduction] = useState(true);
+  const [incEditId, setIncEditId] = useState(null); // exId com editor de incremento aberto
+  const [draftRestored, setDraftRestored] = useState(false);
+  const fileRef = useRef(null); // input de arquivo (escondido) para importar backup
 
   useEffect(() => {
     (async () => {
       const s = await loadKey(KEY_STATE, { week: 1 });
-      const l = await loadKey(KEY_LOG, { sessions: [], perf: {} });
+      const l = await loadKey(KEY_LOG, { sessions: [], perf: {}, incs: {} });
+      if (!l.incs) l.incs = {};
       // Migração: garante que toda sessão tenha um id para poder ser reaberta/editada.
       let changed = false;
       l.sessions = (l.sessions || []).map((sess, i) => {
@@ -348,6 +357,19 @@ export default function App() {
       if (changed) saveKey(KEY_LOG, l);
       setWeek(s.week || 1);
       setLog(l);
+
+      // Recupera rascunho de treino em andamento, se o app foi fechado no meio do registro.
+      const draft = await loadKey(KEY_ACTIVE, null);
+      if (draft && draft.workoutId) {
+        const workout = findWorkout(draft.workoutId);
+        if (workout && Array.isArray(draft.entries)) {
+          setActive({ workout, entries: draft.entries, editingId: draft.editingId || null, week: draft.week || s.week || 1 });
+          setDraftRestored(true);
+          setView("session");
+        } else {
+          saveKey(KEY_ACTIVE, null);
+        }
+      }
       setLoading(false);
     })();
   }, []);
@@ -363,6 +385,24 @@ export default function App() {
   const isReturning = gapDays !== null && gapDays >= RETURN_GAP_DAYS;
   const activeFactor = isReturning && applyReturnReduction ? returnFactor(gapDays) : 1;
 
+  // Incremento real de carga da máquina/exercício: usa o que a pessoa ajustou manualmente
+  // (guardado por dispositivo) ou cai pro incremento padrão do plano.
+  const getInc = (ex) => (log.incs && log.incs[ex.id] != null ? log.incs[ex.id] : (ex.inc || 2.5));
+  const setIncFor = (exId, value) => {
+    setLog((l) => {
+      const next = { ...l, incs: { ...(l.incs || {}), [exId]: value } };
+      saveKey(KEY_LOG, next);
+      return next;
+    });
+  };
+
+  /* ---- rascunho: salva o treino em andamento a cada alteração, pra sobreviver ao fechar o app ---- */
+  useEffect(() => {
+    if (loading) return;
+    if (!active) { saveKey(KEY_ACTIVE, null); return; }
+    saveKey(KEY_ACTIVE, { workoutId: active.workout.id, entries: active.entries, editingId: active.editingId, week: active.week });
+  }, [active, loading]);
+
   /* ---- iniciar treino ---- */
   const startWorkout = (workout) => {
     const entries = workout.ex.map((ex) => {
@@ -370,9 +410,9 @@ export default function App() {
       const nSets = ex.sets;
       const baseWeight = last ? last.weight : 0;
       // Em modo de retorno, não sugerimos subir carga — só reduzimos a base.
-      const suggestUp = activeFactor === 1 && last && last.top;
+      const suggestUp = activeFactor === 1 && last && last.top; // bateu topo em todas → sobe carga
       const reducedBase = activeFactor < 1 ? Math.round(baseWeight * activeFactor * 2) / 2 : baseWeight;
-      const startWeight = suggestUp ? +(baseWeight + (ex.inc || 2.5)).toFixed(2) : reducedBase;
+      const startWeight = suggestUp ? +(baseWeight + getInc(ex)).toFixed(2) : reducedBase;
       return {
         exId: ex.id,
         sets: Array.from({ length: nSets }, () => ({
@@ -382,6 +422,7 @@ export default function App() {
         })),
       };
     });
+    setDraftRestored(false);
     setActive({ workout, entries, editingId: null, week, returnAdjusted: activeFactor < 1 });
     setView("session");
   };
@@ -407,6 +448,7 @@ export default function App() {
         };
       });
     }
+    setDraftRestored(false);
     setActive({ workout, entries, editingId: session.id, week: session.week || week });
     setView("session");
   };
@@ -436,15 +478,26 @@ export default function App() {
 
   const finishWorkout = () => {
     const editing = !!active.editingId;
-    if (!window.confirm(editing ? "Salvar as alterações neste treino?" : "Finalizar e salvar este treino?")) return;
     const { workout, entries } = active;
     const wk = active.week || week;
+
+    // Exercícios sem nenhuma série marcada ficam registrados como não realizados no treino.
+    // (Quem fez pelo menos 1 série conta como realizado, mesmo que não tenha completado todas.)
+    const notPerformedNames = entries
+      .filter((e) => !e.sets.some((s) => s.done))
+      .map((e) => workout.ex.find((x) => x.id === e.exId)?.name)
+      .filter(Boolean);
+
+    const confirmMsg = notPerformedNames.length > 0
+      ? `Sem nenhuma série marcada: ${notPerformedNames.join(", ")}. Vão constar como não realizados no treino. Finalizar mesmo assim?`
+      : (editing ? "Salvar as alterações neste treino?" : "Finalizar e salvar este treino?");
+    if (!window.confirm(confirmMsg)) return;
 
     // Recordes: compara com o registro atual ANTES de recalcular.
     let prs = 0;
     entries.forEach((e) => {
       const ex = workout.ex.find((x) => x.id === e.exId);
-      if (!ex || ex.type === "time") return;
+      if (!ex || ex.type === "time" || !e.sets.some((s) => s.done)) return;
       const reps = e.sets.map((s) => +s.reps || 0);
       const weight = e.sets[0]?.weight || 0;
       const prev = log.perf[ex.id];
@@ -459,6 +512,7 @@ export default function App() {
 
     const cleanEntries = entries.map((e) => ({
       exId: e.exId,
+      completed: e.sets.some((s) => s.done),
       sets: e.sets.map((s) => ({ weight: +s.weight || 0, reps: +s.reps || 0, done: !!s.done })),
     }));
 
@@ -480,20 +534,73 @@ export default function App() {
     }
 
     const perf = recomputePerf(sessions, log.perf);
-    const next = { sessions, perf };
+    const next = { ...log, sessions, perf };
     setLog(next);
     saveKey(KEY_LOG, next);
+    saveKey(KEY_ACTIVE, null);
     setActive(null);
     setShowTimer(false);
+    setDraftRestored(false);
     setView(editing ? "history" : "home");
     if (!editing && prs > 0) { setPrToast(`${prs} recorde${prs > 1 ? "s" : ""} nesse treino 🔥`); setTimeout(() => setPrToast(null), 3500); }
   };
 
+  // Nomes dos exercícios não marcados como concluídos numa sessão salva.
+  const skippedInSession = (s) => {
+    if (!Array.isArray(s.entries)) return [];
+    const w = findWorkout(s.workoutId);
+    if (!w) return [];
+    return s.entries
+      .filter((e) => e.completed === false)
+      .map((e) => w.ex.find((x) => x.id === e.exId)?.name)
+      .filter(Boolean);
+  };
+
   const resetAll = async () => {
     if (!window.confirm("Apagar todo o histórico e recomeçar? Isso não pode ser desfeito.")) return;
-    const empty = { sessions: [], perf: {} };
+    const empty = { sessions: [], perf: {}, incs: log.incs || {} };
     setLog(empty); await saveKey(KEY_LOG, empty);
     changeWeek(1);
+  };
+
+  /* ---- backup: exporta tudo pra um arquivo .json que você guarda onde quiser ---- */
+  const exportBackup = () => {
+    const payload = { app: "forja", version: 1, exportedAt: new Date().toISOString(), state: { week }, log };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `forja-backup-${new Date().toISOString().slice(0, 10)}.json`;
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+  };
+
+  /* ---- restaura de um backup, fundindo com o histórico atual (sem duplicar sessões) ---- */
+  const importBackup = async (file) => {
+    if (!file) return;
+    try {
+      const data = JSON.parse(await file.text());
+      const incoming = data.log && Array.isArray(data.log.sessions) ? data.log
+        : (Array.isArray(data.sessions) ? data : null);
+      if (!incoming) { window.alert("Arquivo de backup inválido — não encontrei os treinos."); return; }
+
+      // Funde por id: mantém os treinos atuais e adiciona os do backup, sem repetir.
+      const byId = new Map();
+      (log.sessions || []).forEach((s) => { if (s && s.id) byId.set(s.id, s); });
+      incoming.sessions.forEach((s) => { if (s && s.id) byId.set(s.id, s); });
+      const sessions = [...byId.values()]
+        .sort((a, b) => new Date(b.date) - new Date(a.date))
+        .slice(0, 200);
+
+      const incs = { ...(log.incs || {}), ...(incoming.incs || {}) };
+      const perf = recomputePerf(sessions, { ...(log.perf || {}), ...(incoming.perf || {}) });
+      const next = { sessions, perf, incs };
+      setLog(next); await saveKey(KEY_LOG, next);
+      if (data.state && data.state.week) changeWeek(data.state.week);
+      window.alert(`Backup importado. Total: ${sessions.length} treino${sessions.length > 1 ? "s" : ""}.`);
+    } catch {
+      window.alert("Não consegui ler esse arquivo. Confira se é um backup do FORJA (.json).");
+    }
   };
 
   if (loading) return <div className="loadScreen"><Dumbbell className="spin" size={28} /><span>Carregando…</span></div>;
@@ -604,11 +711,12 @@ export default function App() {
       {view === "session" && active && (
         <main className="wrap sessionWrap">
           <div className="sessionHead">
-            <button className="backBtn" onClick={() => { if (window.confirm("Sair sem salvar as alterações?")) { const e = active.editingId; setActive(null); setView(e ? "history" : "home"); setShowTimer(false); } }}>
+            <button className="backBtn" onClick={() => { if (window.confirm("Sair sem salvar as alterações?")) { const e = active.editingId; setActive(null); saveKey(KEY_ACTIVE, null); setDraftRestored(false); setView(e ? "history" : "home"); setShowTimer(false); } }}>
               <ChevronLeft size={18} /> Sair
             </button>
             <div className="sessionTitle">
               {active.editingId && <span className="editBadge">editando</span>}
+              {draftRestored && <span className="editBadge">rascunho recuperado</span>}
               {active.workout.name}
             </div>
             <button className="timerBtn" onClick={() => setShowTimer((s) => !s)}><TimerIcon size={18} /></button>
@@ -644,11 +752,25 @@ export default function App() {
                   {last && (
                     <div className={"exHint" + (suggestUp ? " exHintUp" : "")}>
                       {suggestUp ? (
-                        <><Award size={13} /> Bateu o topo — sugestão: subir para {(last.weight + (ex.inc || 2.5)).toFixed(ex.inc < 1 ? 0 : 1)} kg</>
+                        <><Award size={13} /> Bateu o topo — sugestão: subir para {(last.weight + getInc(ex)).toFixed(getInc(ex) < 1 ? 0 : 1)} kg</>
                       ) : ex.type === "time" ? (
                         <>Última: {last.reps.join("/")}s — busque superar</>
                       ) : (
                         <>Última: {last.weight} kg · {last.reps.join("/")} reps — busque {ex.sets}×{ex.max}</>
+                      )}
+                    </div>
+                  )}
+
+                  {ex.type !== "time" && (
+                    <div className="incRow">
+                      <button className="incBtn" onClick={() => setIncEditId(incEditId === ex.id ? null : ex.id)}>
+                        <Pencil size={11} /> incremento dessa máquina: {getInc(ex)} kg
+                      </button>
+                      {incEditId === ex.id && (
+                        <div className="incEditor">
+                          <span className="incEditorLabel">Qual o próximo peso disponível nessa máquina?</span>
+                          <Stepper value={getInc(ex)} onChange={(v) => setIncFor(ex.id, v)} step={0.5} min={0.5} suffix="kg" />
+                        </div>
                       )}
                     </div>
                   )}
@@ -665,7 +787,7 @@ export default function App() {
                           <>
                             <div className="setField">
                               <label>kg</label>
-                              <Stepper value={s.weight} onChange={(v) => updateSet(i, j, "weight", v)} step={ex.inc || 2.5} min={0} />
+                              <Stepper value={s.weight} onChange={(v) => updateSet(i, j, "weight", v)} step={getInc(ex)} min={0} />
                             </div>
                             <div className="setField">
                               <label>reps</label>
@@ -696,11 +818,26 @@ export default function App() {
       {view === "history" && (
         <main className="wrap">
           <h1 className="pageTitle">Histórico</h1>
+
+          {/* input escondido usado pelo "Importar backup" */}
+          <input
+            ref={fileRef}
+            type="file"
+            accept="application/json,.json"
+            style={{ display: "none" }}
+            onChange={(e) => { importBackup(e.target.files[0]); e.target.value = ""; }}
+          />
+
           {log.sessions.length === 0 ? (
-            <div className="empty">
-              <Flame size={26} />
-              <p>Nenhum treino ainda. Comece pela Fase 1 e cada série registrada aparece aqui.</p>
-            </div>
+            <>
+              <div className="empty">
+                <Flame size={26} />
+                <p>Nenhum treino ainda. Comece pela Fase 1 e cada série registrada aparece aqui.</p>
+              </div>
+              <div className="backupRow">
+                <button className="backupBtn" onClick={() => fileRef.current?.click()}><Upload size={15} /> Importar backup</button>
+              </div>
+            </>
           ) : (
             <>
               <div className="statRow">
@@ -714,18 +851,31 @@ export default function App() {
               <div className="sectionLabel">Sessões</div>
               <div className="histHint">Toque em uma sessão para reabrir e editar as séries</div>
               <div className="histList">
-                {log.sessions.map((s, i) => (
-                  <button key={s.id || i} className="histRow" onClick={() => reopenSession(s)}>
-                    <div className="histLeft">
-                      <div className="histName">{s.workoutName}</div>
-                      <div className="histMeta">{new Date(s.date).toLocaleDateString("pt-BR", { day: "2-digit", month: "short", year: "2-digit" })} · sem {s.week}</div>
-                    </div>
-                    <div className="histRight">
-                      <span className="histVol">{s.volume.toLocaleString("pt-BR")} <span>kg·rep</span></span>
-                      <Pencil size={13} className="histEdit" />
-                    </div>
-                  </button>
-                ))}
+                {log.sessions.map((s, i) => {
+                  const skipped = skippedInSession(s);
+                  return (
+                    <button key={s.id || i} className="histRow" onClick={() => reopenSession(s)}>
+                      <div className="histLeft">
+                        <div className="histName">{s.workoutName}</div>
+                        <div className="histMeta">{new Date(s.date).toLocaleDateString("pt-BR", { day: "2-digit", month: "short", year: "2-digit" })} · sem {s.week}</div>
+                        {skipped.length > 0 && (
+                          <div className="histSkipped">{skipped.length} não realizado{skipped.length > 1 ? "s" : ""}: {skipped.join(", ")}</div>
+                        )}
+                      </div>
+                      <div className="histRight">
+                        <span className="histVol">{s.volume.toLocaleString("pt-BR")} <span>kg·rep</span></span>
+                        <Pencil size={13} className="histEdit" />
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+
+              <div className="sectionLabel">Backup dos dados</div>
+              <div className="histHint">O histórico fica salvo só neste aparelho. Exporte um arquivo pra não perder ao trocar de celular ou limpar o navegador — e importe pra restaurar.</div>
+              <div className="backupRow">
+                <button className="backupBtn" onClick={exportBackup}><Download size={15} /> Exportar backup</button>
+                <button className="backupBtn" onClick={() => fileRef.current?.click()}><Upload size={15} /> Importar backup</button>
               </div>
 
               <button className="dangerBtn" onClick={resetAll}><RotateCcw size={15} /> Zerar histórico</button>
@@ -940,6 +1090,14 @@ const CSS = `
 .exHint{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--muted);background:var(--surface2);border:1px solid var(--line);border-radius:9px;padding:7px 10px;margin-bottom:11px;display:flex;align-items:center;gap:6px;}
 .exHint.exHintUp{color:var(--ember);border-color:rgba(230,169,70,.4);background:rgba(230,169,70,.08);}
 
+.incRow{margin-bottom:11px;}
+.incBtn{display:flex;align-items:center;gap:6px;background:none;border:none;color:var(--muted);
+  font-family:'JetBrains Mono',monospace;font-size:10.5px;padding:0;cursor:pointer;}
+.incBtn:hover{color:var(--steel);}
+.incEditor{display:flex;flex-direction:column;gap:6px;margin-top:8px;padding:10px;border-radius:10px;
+  background:var(--surface2);border:1px solid var(--line);}
+.incEditorLabel{font-size:11.5px;color:var(--muted);line-height:1.4;}
+
 .setRows{display:flex;flex-direction:column;gap:8px;}
 .setRow{display:flex;align-items:flex-end;gap:10px;padding:8px;border-radius:11px;background:var(--surface2);border:1px solid transparent;transition:.15s;}
 .setRow.setDone{border-color:rgba(99,185,138,.4);background:rgba(99,185,138,.07);}
@@ -998,8 +1156,16 @@ const CSS = `
 .editBadge{display:inline-block;font-family:'JetBrains Mono',monospace;font-size:9.5px;text-transform:uppercase;letter-spacing:.1em;color:var(--ember);border:1px solid rgba(230,169,70,.4);background:rgba(230,169,70,.08);border-radius:6px;padding:2px 6px;margin-right:9px;vertical-align:middle;}
 .histName{font-weight:600;font-size:14px;}
 .histMeta{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--muted);margin-top:2px;}
+.histSkipped{font-size:11px;color:var(--ember);margin-top:5px;line-height:1.4;}
 .histVol{font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--good);font-weight:700;}
 .histVol span{color:var(--muted);font-weight:500;font-size:10px;}
+
+.backupRow{display:flex;gap:9px;margin:2px 0 18px;flex-wrap:wrap;}
+.backupBtn{flex:1;min-width:140px;display:flex;align-items:center;justify-content:center;gap:7px;background:var(--surface);
+  border:1px solid var(--line);color:var(--text);border-radius:11px;padding:11px 14px;font-size:13px;cursor:pointer;
+  font-family:'Inter',sans-serif;transition:.14s;}
+.backupBtn:hover{border-color:var(--steel);color:var(--steel);}
+.backupBtn svg{color:var(--steel);}
 
 .dangerBtn{display:flex;align-items:center;gap:6px;margin:6px auto 30px;background:none;border:1px solid var(--line);color:var(--muted);border-radius:10px;padding:9px 14px;font-size:12.5px;cursor:pointer;}
 .dangerBtn:hover{color:#E08585;border-color:#5c3535;}
