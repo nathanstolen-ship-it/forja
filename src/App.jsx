@@ -177,6 +177,17 @@ const findWorkout = (id) => {
   for (const p of PHASES) { const w = p.workouts.find((w) => w.id === id); if (w) return w; }
   return null;
 };
+
+/* ============================ RETORNO APÓS PAUSA ============================ */
+// A partir de quantos dias sem treinar mostramos o aviso de retorno.
+const RETURN_GAP_DAYS = 10;
+const daysSince = (dateStr) => Math.floor((Date.now() - new Date(dateStr).getTime()) / 86400000);
+// Redução sugerida na carga inicial, conforme o tamanho da pausa.
+const returnFactor = (days) => {
+  if (days >= 28) return 0.75;
+  if (days >= 14) return 0.85;
+  return 0.9;
+};
 // Reconstrói o "melhor registro" de cada exercício a partir das sessões que têm séries salvas.
 function recomputePerf(sessions, base = {}) {
   const perf = { ...base };
@@ -321,6 +332,7 @@ export default function App() {
   const [showTimer, setShowTimer] = useState(false);
   const [prToast, setPrToast] = useState(null);
   const [infoEx, setInfoEx] = useState(null); // { id, name } — painel de execução
+  const [applyReturnReduction, setApplyReturnReduction] = useState(true);
 
   useEffect(() => {
     (async () => {
@@ -344,14 +356,23 @@ export default function App() {
 
   const phase = phaseForWeek(week);
 
+  // Retorno após pausa: calculado a partir da data da última sessão salva.
+  // Não altera nem lê nada além disso — histórico e recordes ficam intactos.
+  const lastSession = log.sessions[0] || null;
+  const gapDays = lastSession ? daysSince(lastSession.date) : null;
+  const isReturning = gapDays !== null && gapDays >= RETURN_GAP_DAYS;
+  const activeFactor = isReturning && applyReturnReduction ? returnFactor(gapDays) : 1;
+
   /* ---- iniciar treino ---- */
   const startWorkout = (workout) => {
     const entries = workout.ex.map((ex) => {
       const last = log.perf[ex.id];
       const nSets = ex.sets;
       const baseWeight = last ? last.weight : 0;
-      const suggestUp = last && last.top; // bateu topo em todas → sobe carga
-      const startWeight = suggestUp ? +(baseWeight + (ex.inc || 2.5)).toFixed(2) : baseWeight;
+      // Em modo de retorno, não sugerimos subir carga — só reduzimos a base.
+      const suggestUp = activeFactor === 1 && last && last.top;
+      const reducedBase = activeFactor < 1 ? Math.round(baseWeight * activeFactor * 2) / 2 : baseWeight;
+      const startWeight = suggestUp ? +(baseWeight + (ex.inc || 2.5)).toFixed(2) : reducedBase;
       return {
         exId: ex.id,
         sets: Array.from({ length: nSets }, () => ({
@@ -361,7 +382,7 @@ export default function App() {
         })),
       };
     });
-    setActive({ workout, entries, editingId: null, week });
+    setActive({ workout, entries, editingId: null, week, returnAdjusted: activeFactor < 1 });
     setView("session");
   };
 
@@ -528,6 +549,28 @@ export default function App() {
             </div>
           </section>
 
+          {isReturning && (
+            <div className="returnBanner">
+              <div className="returnBannerHead"><RotateCcw size={16} /> Retorno após {gapDays} dias sem treinar</div>
+              <p className="returnBannerText">
+                {gapDays >= 28
+                  ? "Pausa longa — vale considerar repetir a semana atual antes de avançar."
+                  : gapDays >= 14
+                  ? "Pausa moderada — vá com calma nas primeiras sessões."
+                  : "Pausa curta — nada grave, só reduza um pouco pra reabituar."}{" "}
+                Sugestão aplicada: cargas iniciais ~{Math.round((1 - returnFactor(gapDays)) * 100)}% mais leves que seu último registro.
+              </p>
+              <label className="returnToggle">
+                <input
+                  type="checkbox"
+                  checked={applyReturnReduction}
+                  onChange={(e) => setApplyReturnReduction(e.target.checked)}
+                />
+                Aplicar redução automática na carga inicial dos treinos
+              </label>
+            </div>
+          )}
+
           <div className="sectionLabel">Treinos da fase</div>
           <div className="workoutGrid">
             {phase.workouts.map((w) => (
@@ -570,6 +613,12 @@ export default function App() {
             </div>
             <button className="timerBtn" onClick={() => setShowTimer((s) => !s)}><TimerIcon size={18} /></button>
           </div>
+
+          {active.returnAdjusted && (
+            <div className="returnNote">
+              <RotateCcw size={13} /> Cargas iniciais reduzidas (retorno após pausa) — ajuste se sentir fácil ou difícil demais.
+            </div>
+          )}
 
           <div className="exList">
             {active.workout.ex.map((ex, i) => {
@@ -852,6 +901,14 @@ const CSS = `
 .weekNum{font-family:'Barlow Condensed',sans-serif;font-weight:700;font-size:26px;min-width:26px;text-align:center;color:var(--ember);}
 
 .sectionLabel{font-family:'JetBrains Mono',monospace;font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);margin:0 0 10px 2px;}
+
+/* retorno após pausa */
+.returnBanner{background:rgba(230,169,70,.08);border:1px solid rgba(230,169,70,.35);border-radius:14px;padding:14px 16px;margin-bottom:22px;}
+.returnBannerHead{display:flex;align-items:center;gap:8px;font-weight:700;font-size:14px;color:var(--ember);margin-bottom:6px;}
+.returnBannerText{font-size:12.5px;color:var(--muted);line-height:1.5;margin:0 0 10px;}
+.returnToggle{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--text);cursor:pointer;}
+.returnToggle input{accent-color:var(--ember);width:15px;height:15px;cursor:pointer;}
+.returnNote{display:flex;align-items:center;gap:7px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--ember);background:rgba(230,169,70,.08);border:1px solid rgba(230,169,70,.3);border-radius:10px;padding:8px 11px;margin:-2px 0 14px;}
 
 /* workout cards */
 .workoutGrid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:22px;}
