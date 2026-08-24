@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from "react";
 import {
   Dumbbell, Play, Check, Plus, Minus, Timer as TimerIcon, TrendingUp,
   ChevronLeft, History as HistoryIcon, ClipboardList, Flame, RotateCcw,
-  X, Award, Save, Pencil, Info, Download, Upload
+  X, Award, Save, Pencil, Info, Download, Upload, CalendarDays
 } from "lucide-react";
 import { EXERCICIOS_INFO, ATRIBUICAO_MIDIA } from "./data/exercicios.js";
 
@@ -188,6 +188,32 @@ const returnFactor = (days) => {
   if (days >= 14) return 0.85;
   return 0.9;
 };
+
+/* ============================ DATA DO TREINO ============================ */
+// O treino é salvo com a data escolhida no registro — por padrão o dia em que ele
+// começou, não o dia em que você lembrou de finalizar. Resolve o caso de deixar a
+// sessão aberta e só clicar em "Finalizar" dias depois.
+// "ymd" = string local no formato YYYY-MM-DD (a mesma que o <input type="date"> usa).
+const toYmd = (dateish) => {
+  const d = new Date(dateish);
+  if (isNaN(d)) return "";
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+};
+const todayYmd = () => toYmd(new Date());
+// Converte de volta para ISO. Se o dia escolhido for o mesmo da referência (início do
+// treino), preserva o horário original; se foi alterado, marca meio-dia local — assim a
+// data exibida nunca "vira" para o dia anterior por causa do fuso.
+const ymdToIso = (ymd, refIso) => {
+  const ref = refIso ? new Date(refIso) : new Date();
+  if (!isNaN(ref) && toYmd(ref) === ymd) return ref.toISOString();
+  const [y, m, d] = String(ymd).split("-").map(Number);
+  if (!y || !m || !d) return new Date().toISOString();
+  return new Date(y, m - 1, d, 12, 0, 0, 0).toISOString();
+};
+const ymdToBR = (ymd) => {
+  const [y, m, d] = String(ymd).split("-");
+  return y && m && d ? `${d}/${m}/${y}` : "";
+};
 // Reconstrói o "melhor registro" de cada exercício a partir das sessões que têm séries salvas.
 // Só treinos NOVOS marcados como não realizados (completed === false) são ignorados como
 // referência. Sessões antigas (sem o campo completed) contam exatamente como antes — a regra
@@ -363,7 +389,15 @@ export default function App() {
       if (draft && draft.workoutId) {
         const workout = findWorkout(draft.workoutId);
         if (workout && Array.isArray(draft.entries)) {
-          setActive({ workout, entries: draft.entries, editingId: draft.editingId || null, week: draft.week || s.week || 1 });
+          setActive({
+            workout,
+            entries: draft.entries,
+            editingId: draft.editingId || null,
+            week: draft.week || s.week || 1,
+            startedAt: draft.startedAt || null,
+            // Rascunho antigo (sem startedAt) cai para hoje — não dá para adivinhar o dia.
+            date: draft.date || (draft.startedAt ? toYmd(draft.startedAt) : todayYmd()),
+          });
           setDraftRestored(true);
           setView("session");
         } else {
@@ -377,6 +411,7 @@ export default function App() {
   const changeWeek = (w) => { setWeek(w); saveKey(KEY_STATE, { week: w }); };
 
   const phase = phaseForWeek(week);
+  const today = todayYmd();
 
   // Retorno após pausa: calculado a partir da data da última sessão salva.
   // Não altera nem lê nada além disso — histórico e recordes ficam intactos.
@@ -400,7 +435,10 @@ export default function App() {
   useEffect(() => {
     if (loading) return;
     if (!active) { saveKey(KEY_ACTIVE, null); return; }
-    saveKey(KEY_ACTIVE, { workoutId: active.workout.id, entries: active.entries, editingId: active.editingId, week: active.week });
+    saveKey(KEY_ACTIVE, {
+      workoutId: active.workout.id, entries: active.entries, editingId: active.editingId,
+      week: active.week, startedAt: active.startedAt, date: active.date,
+    });
   }, [active, loading]);
 
   /* ---- iniciar treino ---- */
@@ -423,7 +461,8 @@ export default function App() {
       };
     });
     setDraftRestored(false);
-    setActive({ workout, entries, editingId: null, week, returnAdjusted: activeFactor < 1 });
+    const startedAt = new Date().toISOString();
+    setActive({ workout, entries, editingId: null, week, returnAdjusted: activeFactor < 1, startedAt, date: toYmd(startedAt) });
     setView("session");
   };
 
@@ -449,8 +488,15 @@ export default function App() {
       });
     }
     setDraftRestored(false);
-    setActive({ workout, entries, editingId: session.id, week: session.week || week });
+    setActive({ workout, entries, editingId: session.id, week: session.week || week, startedAt: session.date, date: toYmd(session.date) });
     setView("session");
+  };
+
+  // Data do treino: editável no registro e na edição de uma sessão salva. Nunca no futuro.
+  const setSessionDate = (ymd) => {
+    if (!ymd) return;
+    const max = todayYmd();
+    setActive((a) => (a ? { ...a, date: ymd > max ? max : ymd } : a));
   };
 
   const updateSet = (exIdx, setIdx, field, val) => {
@@ -480,6 +526,9 @@ export default function App() {
     const editing = !!active.editingId;
     const { workout, entries } = active;
     const wk = active.week || week;
+    const dateYmd = active.date || todayYmd();
+    const dateIso = ymdToIso(dateYmd, active.startedAt);
+    const backdated = dateYmd !== todayYmd();
 
     // Exercícios sem nenhuma série marcada ficam registrados como não realizados no treino.
     // (Quem fez pelo menos 1 série conta como realizado, mesmo que não tenha completado todas.)
@@ -488,9 +537,11 @@ export default function App() {
       .map((e) => workout.ex.find((x) => x.id === e.exId)?.name)
       .filter(Boolean);
 
-    const confirmMsg = notPerformedNames.length > 0
+    const baseMsg = notPerformedNames.length > 0
       ? `Sem nenhuma série marcada: ${notPerformedNames.join(", ")}. Vão constar como não realizados no treino. Finalizar mesmo assim?`
       : (editing ? "Salvar as alterações neste treino?" : "Finalizar e salvar este treino?");
+    // Deixa a data explícita na confirmação sempre que não for hoje, pra não passar batido.
+    const confirmMsg = backdated ? `${baseMsg}\n\nSerá registrado em ${ymdToBR(dateYmd)}.` : baseMsg;
     if (!window.confirm(confirmMsg)) return;
 
     // Recordes: compara com o registro atual ANTES de recalcular.
@@ -520,18 +571,21 @@ export default function App() {
     if (editing) {
       sessions = log.sessions.map((s) =>
         s.id === active.editingId
-          ? { ...s, entries: cleanEntries, volume: Math.round(volume), workoutName: workout.name, week: wk }
+          ? { ...s, date: dateIso, entries: cleanEntries, volume: Math.round(volume), workoutName: workout.name, week: wk }
           : s
       );
     } else {
       const session = {
         id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
-        date: new Date().toISOString(),
+        date: dateIso,
         week: wk, phaseId: phaseForWeek(wk).id, workoutId: workout.id, workoutName: workout.name,
         volume: Math.round(volume), entries: cleanEntries,
       };
-      sessions = [session, ...log.sessions].slice(0, 200);
+      sessions = [session, ...log.sessions];
     }
+    // Com data editável a sessão nem sempre é a mais recente — reordena para o histórico,
+    // o "último treino" e o cálculo de retorno após pausa continuarem corretos.
+    sessions = sessions.sort((a, b) => new Date(b.date) - new Date(a.date)).slice(0, 200);
 
     const perf = recomputePerf(sessions, log.perf);
     const next = { ...log, sessions, perf };
@@ -722,6 +776,24 @@ export default function App() {
             <button className="timerBtn" onClick={() => setShowTimer((s) => !s)}><TimerIcon size={18} /></button>
           </div>
 
+          <div className={"dateRow" + (active.date && active.date !== today ? " dateRowPast" : "")}>
+            <label className="dateLabel" htmlFor="sessionDate"><CalendarDays size={14} /> Data do treino</label>
+            <input
+              id="sessionDate"
+              className="dateInput"
+              type="date"
+              value={active.date || today}
+              max={today}
+              onChange={(e) => setSessionDate(e.target.value)}
+            />
+          </div>
+          {active.date && active.date !== today && (
+            <div className="dateWarn">
+              Vai ser salvo em <b>{ymdToBR(active.date)}</b>, não hoje.
+              <button className="dateTodayBtn" onClick={() => setSessionDate(today)}>usar hoje</button>
+            </div>
+          )}
+
           {active.returnAdjusted && (
             <div className="returnNote">
               <RotateCcw size={13} /> Cargas iniciais reduzidas (retorno após pausa) — ajuste se sentir fácil ou difícil demais.
@@ -849,7 +921,7 @@ export default function App() {
               {log.sessions.length > 1 && <VolumeChart sessions={log.sessions} />}
 
               <div className="sectionLabel">Sessões</div>
-              <div className="histHint">Toque em uma sessão para reabrir e editar as séries</div>
+              <div className="histHint">Toque em uma sessão para reabrir e editar as séries ou a data</div>
               <div className="histList">
                 {log.sessions.map((s, i) => {
                   const skipped = skippedInSession(s);
@@ -1078,6 +1150,15 @@ const CSS = `
 /* session */
 .sessionWrap{padding-bottom:120px;}
 .sessionHead{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;}
+.dateRow{display:flex;align-items:center;justify-content:space-between;gap:12px;background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:9px 12px;margin-bottom:12px;}
+.dateRow.dateRowPast{border-color:rgba(230,169,70,.45);background:rgba(230,169,70,.06);}
+.dateLabel{display:flex;align-items:center;gap:7px;font-family:'JetBrains Mono',monospace;font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);}
+.dateRowPast .dateLabel{color:var(--ember);}
+.dateInput{font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--text);background:var(--surface2);border:1px solid var(--line);border-radius:8px;padding:6px 9px;}
+.dateInput::-webkit-calendar-picker-indicator{filter:invert(.7);cursor:pointer;}
+.dateWarn{display:flex;align-items:center;flex-wrap:wrap;gap:8px;font-size:12px;color:var(--ember);margin:-4px 0 14px 2px;}
+.dateTodayBtn{font-family:'JetBrains Mono',monospace;font-size:10.5px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);background:transparent;border:1px solid var(--line);border-radius:6px;padding:3px 8px;cursor:pointer;}
+.dateTodayBtn:active{transform:scale(.96);}
 .backBtn{display:flex;align-items:center;gap:2px;background:none;border:none;color:var(--muted);font-size:14px;cursor:pointer;padding:6px 8px 6px 0;}
 .sessionTitle{font-family:'Barlow Condensed',sans-serif;font-weight:700;font-size:22px;letter-spacing:.02em;}
 .timerBtn{width:40px;height:40px;border-radius:11px;border:1px solid var(--line);background:var(--surface);color:var(--steel);display:grid;place-items:center;cursor:pointer;}
