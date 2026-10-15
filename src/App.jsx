@@ -1,10 +1,13 @@
-import React, { useState, useEffect, useRef, useCallback } from "react";
+import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import {
   Dumbbell, Play, Check, Plus, Minus, Timer as TimerIcon, TrendingUp,
   ChevronLeft, History as HistoryIcon, ClipboardList, Flame, RotateCcw,
   X, Award, Save, Pencil, Info, Download, Upload, CalendarDays
 } from "lucide-react";
 import { EXERCICIOS_INFO, ATRIBUICAO_MIDIA } from "./data/exercicios.js";
+import {
+  findComeback, isTrainedSession, setsForStage, comebackWeight, comebackSeconds, SETS_LABEL,
+} from "./retorno.js";
 
 /* ============================ PLANO (16 semanas) ============================ */
 // type: "load" (carga×reps) | "time" (segundos) — inc = menor incremento de carga
@@ -179,14 +182,13 @@ const findWorkout = (id) => {
 };
 
 /* ============================ RETORNO APÓS PAUSA ============================ */
-// A partir de quantos dias sem treinar mostramos o aviso de retorno.
-const RETURN_GAP_DAYS = 10;
-const daysSince = (dateStr) => Math.floor((Date.now() - new Date(dateStr).getTime()) / 86400000);
-// Redução sugerida na carga inicial, conforme o tamanho da pausa.
-const returnFactor = (days) => {
-  if (days >= 28) return 0.75;
-  if (days >= 14) return 0.85;
-  return 0.9;
+// Faixas, rampa e cargas ficam em ./retorno.js. Aqui só o que depende do plano.
+// Semana onde recomeçar, ancorada na semana do último treino ANTES da pausa — não na
+// semana atual, senão a sugestão desceria de novo depois de você voltar a semana.
+// null = não precisa voltar no plano.
+const restartWeekFor = (tier, anchorWeek) => {
+  const target = PHASES.find((p) => p.id === tier.restart[phaseForWeek(anchorWeek).id]);
+  return target ? Math.min(anchorWeek, target.weeks[0]) : null;
 };
 
 /* ============================ DATA DO TREINO ============================ */
@@ -363,7 +365,7 @@ export default function App() {
   const [showTimer, setShowTimer] = useState(false);
   const [prToast, setPrToast] = useState(null);
   const [infoEx, setInfoEx] = useState(null); // { id, name } — painel de execução
-  const [applyReturnReduction, setApplyReturnReduction] = useState(true);
+  const [applyComeback, setApplyComeback] = useState(true);
   const [incEditId, setIncEditId] = useState(null); // exId com editor de incremento aberto
   const [draftRestored, setDraftRestored] = useState(false);
   const fileRef = useRef(null); // input de arquivo (escondido) para importar backup
@@ -394,6 +396,7 @@ export default function App() {
             entries: draft.entries,
             editingId: draft.editingId || null,
             week: draft.week || s.week || 1,
+            comeback: draft.comeback || null,
             startedAt: draft.startedAt || null,
             // Rascunho antigo (sem startedAt) cai para hoje — não dá para adivinhar o dia.
             date: draft.date || (draft.startedAt ? toYmd(draft.startedAt) : todayYmd()),
@@ -413,12 +416,36 @@ export default function App() {
   const phase = phaseForWeek(week);
   const today = todayYmd();
 
-  // Retorno após pausa: calculado a partir da data da última sessão salva.
-  // Não altera nem lê nada além disso — histórico e recordes ficam intactos.
-  const lastSession = log.sessions[0] || null;
-  const gapDays = lastSession ? daysSince(lastSession.date) : null;
-  const isReturning = gapDays !== null && gapDays >= RETURN_GAP_DAYS;
-  const activeFactor = isReturning && applyReturnReduction ? returnFactor(gapDays) : 1;
+  // Retorno após pausa: derivado só do histórico — nada novo é gravado, histórico e
+  // recordes ficam intactos. `ref` = registro de cada exercício antes da pausa, base da
+  // rampa de cargas e dos recordes durante o retorno.
+  const comeback = useMemo(() => {
+    const cb = findComeback(log.sessions, new Date(), (s) => phaseForWeek(s.week || week).id);
+    if (!cb) return null;
+    const cutoff = new Date(cb.lastBefore.date);
+    const base = Object.fromEntries(
+      Object.entries(log.perf || {}).filter(([, p]) => p && p.date && new Date(p.date) <= cutoff)
+    );
+    const anchorWeek = cb.lastBefore.week || week;
+    return { ...cb, ref: recomputePerf(cb.before, base), anchorWeek, targetWeek: restartWeekFor(cb.tier, anchorWeek) };
+  }, [log.sessions, log.perf, week]);
+  const activeStage = comeback && applyComeback ? comeback.stage : null;
+
+  // Próximo treino sugerido da fase: o que está há mais tempo sem ser feito (nunca feito vem primeiro).
+  const nextWorkoutId = (() => {
+    const lastDone = {};
+    log.sessions.filter(isTrainedSession).forEach((s) => {
+      const t = new Date(s.date).getTime();
+      if (!(lastDone[s.workoutId] >= t)) lastDone[s.workoutId] = t;
+    });
+    let best = null;
+    phase.workouts.forEach((w) => {
+      const t = lastDone[w.id] ?? -Infinity;
+      if (!best || t < best.t) best = { id: w.id, t };
+    });
+    return best && best.id;
+  })();
+  const nextWorkout = phase.workouts.find((w) => w.id === nextWorkoutId) || null;
 
   // Incremento real de carga da máquina/exercício: usa o que a pessoa ajustou manualmente
   // (guardado por dispositivo) ou cai pro incremento padrão do plano.
@@ -437,32 +464,52 @@ export default function App() {
     if (!active) { saveKey(KEY_ACTIVE, null); return; }
     saveKey(KEY_ACTIVE, {
       workoutId: active.workout.id, entries: active.entries, editingId: active.editingId,
-      week: active.week, startedAt: active.startedAt, date: active.date,
+      week: active.week, comeback: active.comeback || null, startedAt: active.startedAt, date: active.date,
     });
   }, [active, loading]);
 
   /* ---- iniciar treino ---- */
   const startWorkout = (workout) => {
+    const stage = activeStage;
+    const cutoff = comeback ? new Date(comeback.lastBefore.date) : null;
     const entries = workout.ex.map((ex) => {
       const last = log.perf[ex.id];
-      const nSets = ex.sets;
-      const baseWeight = last ? last.weight : 0;
-      // Em modo de retorno, não sugerimos subir carga — só reduzimos a base.
-      const suggestUp = activeFactor === 1 && last && last.top; // bateu topo em todas → sobe carga
-      const reducedBase = activeFactor < 1 ? Math.round(baseWeight * activeFactor * 2) / 2 : baseWeight;
-      const startWeight = suggestUp ? +(baseWeight + getInc(ex)).toFixed(2) : reducedBase;
+      let nSets = ex.sets, startWeight, startSecs;
+      if (stage) {
+        // Rampa de retorno: carga em % do registro de antes da pausa e menos séries no começo.
+        // Sem subir carga por "bateu o topo" — quem manda é a rampa.
+        const ref = comeback.ref[ex.id];
+        const recent = last && new Date(last.date) > cutoff ? last : null; // já feito dentro da rampa
+        nSets = setsForStage(ex.sets, stage.sets);
+        startWeight = comebackWeight({ refWeight: ref?.weight, recentWeight: recent?.weight, load: stage.load, inc: getInc(ex) });
+        startSecs = comebackSeconds({ refSecs: ref?.reps?.[0], recentSecs: recent?.reps?.[0], load: stage.load });
+      } else {
+        const baseWeight = last ? last.weight : 0;
+        const suggestUp = last && last.top; // bateu topo em todas → sobe carga
+        startWeight = suggestUp ? +(baseWeight + getInc(ex)).toFixed(2) : baseWeight;
+        startSecs = last ? last.reps[0] || 30 : 30;
+      }
       return {
         exId: ex.id,
         sets: Array.from({ length: nSets }, () => ({
           weight: ex.type === "time" ? 0 : startWeight,
-          reps: ex.type === "time" ? (last ? last.reps[0] || 30 : 30) : ex.min,
+          reps: ex.type === "time" ? startSecs : ex.min,
           done: false,
         })),
       };
     });
+    // Guarda no treino o que a sessão precisa mostrar (etapa e referência de antes da pausa),
+    // pra continuar certo mesmo se o rascunho for recuperado depois.
+    const cb = stage ? {
+      tier: comeback.tier.id, n: comeback.done + 1, total: comeback.total, ...stage,
+      ref: Object.fromEntries(workout.ex.filter((ex) => comeback.ref[ex.id]).map((ex) => {
+        const r = comeback.ref[ex.id];
+        return [ex.id, { weight: r.weight, reps: r.reps }];
+      })),
+    } : null;
     setDraftRestored(false);
     const startedAt = new Date().toISOString();
-    setActive({ workout, entries, editingId: null, week, returnAdjusted: activeFactor < 1, startedAt, date: toYmd(startedAt) });
+    setActive({ workout, entries, editingId: null, week, comeback: cb, startedAt, date: toYmd(startedAt) });
     setView("session");
   };
 
@@ -544,14 +591,16 @@ export default function App() {
     const confirmMsg = backdated ? `${baseMsg}\n\nSerá registrado em ${ymdToBR(dateYmd)}.` : baseMsg;
     if (!window.confirm(confirmMsg)) return;
 
-    // Recordes: compara com o registro atual ANTES de recalcular.
+    // Recordes: compara com o registro atual ANTES de recalcular. Na rampa de retorno, recorde é
+    // superar o que você fazia antes da pausa — subir de um treino da rampa pro outro não conta.
+    const cb = editing ? null : active.comeback;
     let prs = 0;
     entries.forEach((e) => {
       const ex = workout.ex.find((x) => x.id === e.exId);
       if (!ex || ex.type === "time" || !e.sets.some((s) => s.done)) return;
       const reps = e.sets.map((s) => +s.reps || 0);
       const weight = e.sets[0]?.weight || 0;
-      const prev = log.perf[ex.id];
+      const prev = cb ? cb.ref[ex.id] : log.perf[ex.id];
       if (prev && (weight > prev.weight || (weight === prev.weight && reps.reduce((a, b) => a + b, 0) > prev.reps.reduce((a, b) => a + b, 0)))) prs++;
     });
 
@@ -596,7 +645,11 @@ export default function App() {
     setShowTimer(false);
     setDraftRestored(false);
     setView(editing ? "history" : "home");
-    if (!editing && prs > 0) { setPrToast(`${prs} recorde${prs > 1 ? "s" : ""} nesse treino 🔥`); setTimeout(() => setPrToast(null), 3500); }
+    const toast = editing ? null
+      : prs > 0 ? `${prs} recorde${prs > 1 ? "s" : ""} nesse treino 🔥`
+      : cb ? (cb.n >= cb.total ? "Rampa de retorno concluída — de volta à progressão normal 💪" : `Retorno: treino ${cb.n} de ${cb.total} feito ✓`)
+      : null;
+    if (toast) { setPrToast(toast); setTimeout(() => setPrToast(null), 3500); }
   };
 
   // Nomes dos exercícios não marcados como concluídos numa sessão salva.
@@ -710,40 +763,89 @@ export default function App() {
             </div>
           </section>
 
-          {isReturning && (
-            <div className="returnBanner">
-              <div className="returnBannerHead"><RotateCcw size={16} /> Retorno após {gapDays} dias sem treinar</div>
-              <p className="returnBannerText">
-                {gapDays >= 28
-                  ? "Pausa longa — vale considerar repetir a semana atual antes de avançar."
-                  : gapDays >= 14
-                  ? "Pausa moderada — vá com calma nas primeiras sessões."
-                  : "Pausa curta — nada grave, só reduza um pouco pra reabituar."}{" "}
-                Sugestão aplicada: cargas iniciais ~{Math.round((1 - returnFactor(gapDays)) * 100)}% mais leves que seu último registro.
-              </p>
-              <label className="returnToggle">
-                <input
-                  type="checkbox"
-                  checked={applyReturnReduction}
-                  onChange={(e) => setApplyReturnReduction(e.target.checked)}
-                />
-                Aplicar redução automática na carga inicial dos treinos
-              </label>
-            </div>
-          )}
+          {comeback && (() => {
+            const target = comeback.targetWeek;
+            const targetPhase = target ? phaseForWeek(target) : null;
+            const anchorPhase = phaseForWeek(comeback.anchorWeek);
+            const needsWeekChange = target !== null && week > target;
+            return (
+              <section className="returnCard">
+                <div className="returnHead">
+                  <span className="returnHeadTitle"><RotateCcw size={16} /> {comeback.done === 0 ? `Retorno após ${comeback.gapDays} dias sem treinar` : `Retorno · treino ${comeback.done + 1} de ${comeback.total}`}</span>
+                  <span className="returnTier">{comeback.tier.label}</span>
+                </div>
+                {comeback.done === 0 && <p className="returnWhy">{comeback.tier.why}</p>}
+
+                <div className="returnBlock">
+                  <div className="returnLabel">Onde recomeçar</div>
+                  {target === null ? (
+                    <>
+                      <div className="returnMain">Siga na semana {week} ({phase.label} · {phase.name})</div>
+                      <div className="returnSub">Não precisa voltar no plano — a rampa abaixo dá conta.</div>
+                    </>
+                  ) : (
+                    <>
+                      <div className="returnMain">
+                        {targetPhase.label} · {targetPhase.name} — semana {target}
+                        {week === target && <span className="returnOk"><Check size={13} /> você está aqui</span>}
+                      </div>
+                      <div className="returnSub">
+                        Você parou na semana {comeback.anchorWeek} ({anchorPhase.label} · {anchorPhase.name}).
+                        {targetPhase.id === anchorPhase.id ? ` Repita a fase desde o início: ${targetPhase.split}, ${targetPhase.freq}.` : ` ${targetPhase.split}, ${targetPhase.freq}, ${targetPhase.rir}.`}
+                      </div>
+                      {needsWeekChange && (
+                        <button className="returnBtn" onClick={() => changeWeek(target)}>Ir para a semana {target}</button>
+                      )}
+                    </>
+                  )}
+                </div>
+
+                <div className="returnBlock">
+                  <div className="returnLabel">Rampa de retorno · {comeback.done} de {comeback.total} feito{comeback.done === 1 ? "" : "s"}</div>
+                  <ol className="rampList">
+                    {comeback.tier.stages.map((st, i) => (
+                      <li key={i} className={"rampRow" + (i < comeback.done ? " rampDone" : i === comeback.done ? " rampNow" : "")}>
+                        <span className="rampN">{i < comeback.done ? <Check size={12} /> : i + 1}</span>
+                        <span className="rampLoad">~{Math.round(st.load * 100)}%</span>
+                        <span className="rampSets">{SETS_LABEL[st.sets]}</span>
+                        <span className="rampRir">{st.rir}</span>
+                      </li>
+                    ))}
+                  </ol>
+                  <div className="returnSub">
+                    % da carga que você usava antes da pausa · RIR = repetições que sobram no fim da série. Depois da rampa, volta a progressão normal.
+                  </div>
+                  {comeback.tier.freq && <div className="returnFreq"><CalendarDays size={13} /> {comeback.tier.freq}</div>}
+                  <label className="returnToggle">
+                    <input type="checkbox" checked={applyComeback} onChange={(e) => setApplyComeback(e.target.checked)} />
+                    Aplicar a rampa automaticamente no registro (cargas e séries)
+                  </label>
+                </div>
+
+                {!needsWeekChange && nextWorkout && (
+                  <button className="returnStart" onClick={() => startWorkout(nextWorkout)}>
+                    <Play size={16} /> Começar {nextWorkout.name}{applyComeback ? ` · treino ${comeback.done + 1} de ${comeback.total}` : ""}
+                  </button>
+                )}
+              </section>
+            );
+          })()}
 
           <div className="sectionLabel">Treinos da fase</div>
           <div className="workoutGrid">
-            {phase.workouts.map((w) => (
-              <button key={w.id} className="workoutCard" onClick={() => startWorkout(w)}>
-                <div className="wcTop">
-                  <span className="wcName">{w.name}</span>
-                  <Play size={18} className="wcPlay" />
-                </div>
-                <span className="wcTag">{w.tag}</span>
-                <span className="wcCount">{w.ex.length} exercícios</span>
-              </button>
-            ))}
+            {phase.workouts.map((w) => {
+              const isNext = phase.workouts.length > 1 && w.id === nextWorkoutId;
+              return (
+                <button key={w.id} className={"workoutCard" + (isNext ? " wcNext" : "")} onClick={() => startWorkout(w)}>
+                  <div className="wcTop">
+                    <span className="wcName">{w.name}</span>
+                    <Play size={18} className="wcPlay" />
+                  </div>
+                  <span className="wcTag">{w.tag}</span>
+                  <span className="wcCount">{w.ex.length} exercícios{isNext && <span className="wcNextBadge">próximo</span>}</span>
+                </button>
+              );
+            })}
           </div>
 
           {log.sessions[0] && (
@@ -794,9 +896,12 @@ export default function App() {
             </div>
           )}
 
-          {active.returnAdjusted && (
+          {active.comeback && (
             <div className="returnNote">
-              <RotateCcw size={13} /> Cargas iniciais reduzidas (retorno após pausa) — ajuste se sentir fácil ou difícil demais.
+              <RotateCcw size={13} />
+              <span>
+                Retorno · treino {active.comeback.n} de {active.comeback.total}: ~{Math.round(active.comeback.load * 100)}% da carga de antes da pausa, {SETS_LABEL[active.comeback.sets]}, {active.comeback.rir}. Ajuste se ficar fácil ou pesado demais.
+              </span>
             </div>
           )}
 
@@ -804,13 +909,16 @@ export default function App() {
             {active.workout.ex.map((ex, i) => {
               const last = log.perf[ex.id];
               const suggestUp = last && last.top;
+              const nSets = active.entries[i].sets.length;
+              const cbRef = active.comeback ? active.comeback.ref[ex.id] : null;
               return (
                 <div key={ex.id + i} className="exCard">
                   <div className="exHead">
                     <div>
                       <div className="exName">{ex.name}</div>
                       <div className="exTarget">
-                        {ex.type === "time" ? `${ex.sets} × tempo` : `${ex.sets} × ${ex.min}–${ex.max} reps`}
+                        {ex.type === "time" ? `${nSets} × tempo` : `${nSets} × ${ex.min}–${ex.max} reps`}
+                        {nSets !== ex.sets ? ` (plano: ${ex.sets})` : ""}
                         {ex.note ? ` · ${ex.note}` : ""}
                       </div>
                     </div>
@@ -821,7 +929,17 @@ export default function App() {
                     )}
                   </div>
 
-                  {last && (
+                  {active.comeback ? (
+                    <div className="exHint">
+                      {!cbRef ? (
+                        <>Sem registro antes da pausa — escolha uma carga com folga ({active.comeback.rir})</>
+                      ) : ex.type === "time" ? (
+                        <>Antes da pausa: {cbRef.reps.join("/")}s — hoje sem forçar</>
+                      ) : (
+                        <>Antes da pausa: {cbRef.weight} kg · {cbRef.reps.join("/")} reps</>
+                      )}
+                    </div>
+                  ) : last && (
                     <div className={"exHint" + (suggestUp ? " exHintUp" : "")}>
                       {suggestUp ? (
                         <><Award size={13} /> Bateu o topo — sugestão: subir para {(last.weight + getInc(ex)).toFixed(getInc(ex) < 1 ? 0 : 1)} kg</>
@@ -1125,12 +1243,35 @@ const CSS = `
 .sectionLabel{font-family:'JetBrains Mono',monospace;font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);margin:0 0 10px 2px;}
 
 /* retorno após pausa */
-.returnBanner{background:rgba(230,169,70,.08);border:1px solid rgba(230,169,70,.35);border-radius:14px;padding:14px 16px;margin-bottom:22px;}
-.returnBannerHead{display:flex;align-items:center;gap:8px;font-weight:700;font-size:14px;color:var(--ember);margin-bottom:6px;}
-.returnBannerText{font-size:12.5px;color:var(--muted);line-height:1.5;margin:0 0 10px;}
-.returnToggle{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--text);cursor:pointer;}
-.returnToggle input{accent-color:var(--ember);width:15px;height:15px;cursor:pointer;}
-.returnNote{display:flex;align-items:center;gap:7px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--ember);background:rgba(230,169,70,.08);border:1px solid rgba(230,169,70,.3);border-radius:10px;padding:8px 11px;margin:-2px 0 14px;}
+.returnCard{background:rgba(230,169,70,.06);border:1px solid rgba(230,169,70,.35);border-radius:16px;padding:15px 16px;margin-bottom:22px;}
+.returnHead{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;margin-bottom:8px;}
+.returnHeadTitle{display:flex;align-items:center;gap:8px;font-weight:700;font-size:14px;line-height:1.3;color:var(--ember);}
+.returnHeadTitle svg{flex-shrink:0;}
+.returnTier{flex-shrink:0;font-family:'JetBrains Mono',monospace;font-size:9.5px;text-transform:uppercase;letter-spacing:.08em;color:var(--ember);border:1px solid rgba(230,169,70,.4);border-radius:6px;padding:3px 7px;margin-top:1px;}
+.returnWhy{font-size:12.5px;color:var(--muted);line-height:1.55;margin:0 0 12px;}
+.returnBlock{padding:12px 0 2px;border-top:1px solid rgba(230,169,70,.18);margin-bottom:10px;}
+.returnLabel{font-family:'JetBrains Mono',monospace;font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);margin-bottom:8px;}
+.returnMain{display:flex;align-items:center;flex-wrap:wrap;gap:4px 10px;font-weight:600;font-size:14.5px;color:var(--text);}
+.returnOk{display:inline-flex;align-items:center;gap:4px;font-family:'JetBrains Mono',monospace;font-size:10.5px;font-weight:500;color:var(--good);}
+.returnSub{font-size:12px;color:var(--muted);line-height:1.5;margin-top:5px;}
+.returnBtn{margin-top:10px;font-family:'Inter',sans-serif;font-size:13px;font-weight:600;color:var(--ember);background:transparent;border:1px solid rgba(230,169,70,.55);border-radius:10px;padding:8px 14px;cursor:pointer;}
+.returnBtn:active{transform:scale(.97);}
+.rampList{list-style:none;padding:0;margin:0;display:flex;flex-direction:column;gap:3px;}
+.rampRow{display:grid;grid-template-columns:20px 42px 1fr auto;align-items:center;gap:8px;font-family:'JetBrains Mono',monospace;font-size:11.5px;color:var(--muted);padding:6px 8px;border-radius:8px;border:1px solid transparent;}
+.rampRow.rampNow{color:var(--text);border-color:rgba(230,169,70,.45);background:rgba(230,169,70,.10);}
+.rampRow.rampNow .rampLoad,.rampRow.rampNow .rampN{color:var(--ember);}
+.rampRow.rampDone{opacity:.5;}
+.rampRow.rampDone .rampN{color:var(--good);}
+.rampN{display:grid;place-items:center;font-weight:700;}
+.rampLoad{font-weight:700;}
+.returnFreq{display:flex;align-items:flex-start;gap:7px;font-size:12px;color:var(--text);line-height:1.45;margin-top:10px;}
+.returnFreq svg{flex-shrink:0;color:var(--ember);margin-top:2px;}
+.returnToggle{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--text);cursor:pointer;margin-top:12px;}
+.returnToggle input{accent-color:var(--ember);width:15px;height:15px;cursor:pointer;flex-shrink:0;}
+.returnStart{width:100%;display:flex;align-items:center;justify-content:center;gap:8px;margin-top:4px;background:var(--ember);color:var(--ink);border:none;border-radius:12px;padding:12px 16px;font-weight:700;font-size:14px;cursor:pointer;font-family:'Inter',sans-serif;}
+.returnStart:active{transform:scale(.98);}
+.returnNote{display:flex;align-items:flex-start;gap:7px;font-family:'JetBrains Mono',monospace;font-size:11px;line-height:1.5;color:var(--ember);background:rgba(230,169,70,.08);border:1px solid rgba(230,169,70,.3);border-radius:10px;padding:8px 11px;margin:-2px 0 14px;}
+.returnNote svg{flex-shrink:0;margin-top:2px;}
 
 /* workout cards */
 .workoutGrid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:22px;}
@@ -1140,7 +1281,9 @@ const CSS = `
 .wcName{font-family:'Barlow Condensed',sans-serif;font-weight:700;font-size:19px;letter-spacing:.02em;}
 .wcPlay{color:var(--ember);}
 .wcTag{font-size:12px;color:var(--muted);}
-.wcCount{font-family:'JetBrains Mono',monospace;font-size:10.5px;color:var(--steel);margin-top:2px;}
+.wcCount{display:flex;align-items:center;justify-content:space-between;gap:6px;font-family:'JetBrains Mono',monospace;font-size:10.5px;color:var(--steel);margin-top:2px;}
+.workoutCard.wcNext{border-color:rgba(230,169,70,.55);}
+.wcNextBadge{font-size:9.5px;text-transform:uppercase;letter-spacing:.08em;color:var(--ember);border:1px solid rgba(230,169,70,.45);border-radius:6px;padding:1px 6px;}
 
 .lastCard{display:flex;align-items:center;justify-content:space-between;background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:14px 16px;margin-bottom:8px;}
 .lastName{font-weight:600;font-size:15px;}
