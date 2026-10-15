@@ -59,6 +59,15 @@ export const COMEBACK_TIERS = [
       { load: 0.9, sets: "full", rir: "RIR 2–3" },
       { load: 0.95, sets: "full", rir: "RIR 2" },
     ],
+    fromReadaptation: {
+      why: "Você parou ainda na Readaptação, com poucas semanas de treino. Nessa fase o ganho é mais de técnica e coordenação, que se perde pouco, e as cargas já eram longe da falha. Como a própria Fase 1 já é uma readaptação (máquinas, RIR 3–4, sem falha), a rampa é curta: só os primeiros treinos mais leves, pra evitar dor muscular forte. Se nas 2 primeiras semanas estiver tudo confortável, pode avançar a semana.",
+      freq: "3x/semana, com 1 dia de descanso entre os treinos.",
+      stages: [
+        { load: 0.8, sets: "two", rir: "RIR 4" },
+        { load: 0.9, sets: "full", rir: "RIR 3–4" },
+        { load: 1, sets: "full", rir: "RIR 3–4" },
+      ],
+    },
   },
   {
     id: "muitoLonga", min: 90, label: "Pausa muito longa",
@@ -73,8 +82,23 @@ export const COMEBACK_TIERS = [
       { load: 0.8, sets: "full", rir: "RIR 3" },
       { load: 0.85, sets: "full", rir: "RIR 3" },
     ],
+    fromReadaptation: {
+      why: "Você parou ainda na Readaptação e ficou 3 meses ou mais sem treinar — trate como recomeço. Como a própria Fase 1 já é uma readaptação (máquinas, RIR 3–4, sem falha), a rampa é curta: só os primeiros treinos mais leves, pra evitar dor muscular forte.",
+      freq: "3x/semana, com 1 dia de descanso entre os treinos.",
+      stages: [
+        { load: 0.7, sets: "two", rir: "RIR 4" },
+        { load: 0.8, sets: "full", rir: "RIR 3–4" },
+        { load: 0.9, sets: "full", rir: "RIR 3–4" },
+      ],
+    },
   },
 ];
+
+// Quem parou ainda na Fase 1 (Readaptação) tinha pouco tempo de treino e cargas longe da falha.
+// A Fase 1 já é uma readaptação, então empilhar nela a rampa longa deixaria os treinos leves
+// demais por tempo demais: nesse caso vale a rampa curta da faixa (`fromReadaptation`).
+export const rampFor = (tier, anchorPhaseId) =>
+  anchorPhaseId === "p1" && tier.fromReadaptation ? { ...tier, ...tier.fromReadaptation } : tier;
 
 const MAX_STAGES = Math.max(...COMEBACK_TIERS.map((t) => t.stages.length));
 
@@ -98,12 +122,14 @@ export const isTrainedSession = (s) =>
 
 // Procura a pausa mais recente cuja rampa ainda não terminou.
 // Retorna null quando não há pausa relevante ou quando a rampa já foi cumprida.
+// phaseOf(sessão) = id da fase em que ela foi feita (define a rampa — ver rampFor).
 //   gapDays    — tamanho da pausa
+//   tier       — faixa da pausa, já com a rampa que vale pra fase em que você parou
 //   done/total — treinos já feitos na rampa / tamanho da rampa
 //   stage      — etapa do próximo treino
 //   lastBefore — último treino antes da pausa (âncora da semana e das cargas de referência)
 //   before     — treinos até a pausa, em ordem cronológica
-export function findComeback(sessions, now = new Date()) {
+export function findComeback(sessions, now = new Date(), phaseOf = (s) => s.phaseId) {
   const asc = (sessions || []).filter(isTrainedSession).sort((a, b) => new Date(a.date) - new Date(b.date));
   const today = dayNumber(now);
   for (let i = asc.length - 1; i >= 0; i--) {
@@ -111,7 +137,8 @@ export function findComeback(sessions, now = new Date()) {
     if (done >= MAX_STAGES) break;   // pausa mais antiga que isso: qualquer rampa já acabou
     const next = i === asc.length - 1 ? today : dayNumber(asc[i + 1].date);
     const gapDays = next - dayNumber(asc[i].date);
-    const tier = tierForGap(gapDays);
+    const base = tierForGap(gapDays);
+    const tier = base && rampFor(base, phaseOf(asc[i]));
     // Pausa curta já cumprida no meio de uma rampa maior: a rampa maior continua valendo.
     if (!tier || done >= tier.stages.length) continue;
     return {

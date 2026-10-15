@@ -420,7 +420,7 @@ export default function App() {
   // recordes ficam intactos. `ref` = registro de cada exercício antes da pausa, base da
   // rampa de cargas e dos recordes durante o retorno.
   const comeback = useMemo(() => {
-    const cb = findComeback(log.sessions);
+    const cb = findComeback(log.sessions, new Date(), (s) => phaseForWeek(s.week || week).id);
     if (!cb) return null;
     const cutoff = new Date(cb.lastBefore.date);
     const base = Object.fromEntries(
