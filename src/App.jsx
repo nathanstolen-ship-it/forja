@@ -2,9 +2,10 @@ import React, { useState, useEffect, useRef, useCallback, useMemo } from "react"
 import {
   Dumbbell, Play, Check, Plus, Minus, Timer as TimerIcon, TrendingUp,
   ChevronLeft, History as HistoryIcon, ClipboardList, Flame, RotateCcw,
-  X, Award, Save, Pencil, Info, Download, Upload, CalendarDays
+  X, Award, Save, Pencil, Info, Download, Upload, CalendarDays, ChevronRight
 } from "lucide-react";
 import { EXERCICIOS_INFO, ATRIBUICAO_MIDIA } from "./data/exercicios.js";
+import { grupoDe, opcaoDe } from "./data/alternativas.js";
 import {
   findComeback, isTrainedSession, setsForStage, comebackWeight, comebackSeconds, SETS_LABEL,
 } from "./retorno.js";
@@ -181,6 +182,38 @@ const findWorkout = (id) => {
   return null;
 };
 
+/* ============================ TROCA POR EQUIVALENTE ============================ */
+// Cada exercício do plano é um "slot". O registro guarda `exId` = o que foi feito de verdade
+// e, quando difere do plano, `slot` = o id original do plano. Carga e recordes ficam por
+// exercício real (supino halteres não herda a carga do supino máquina).
+// Escolhas fixas ficam em log.swaps = { idDoPlano: idEscolhido } e valem pro plano inteiro.
+const slotOf = (e) => e.slot || e.exId;
+const resolveEx = (slotEx, exId) => {
+  if (!exId || exId === slotEx.id) return { ...slotEx, slot: slotEx.id };
+  const o = opcaoDe(exId);
+  return { ...slotEx, id: exId, name: o ? o.name : exId, inc: o ? o.inc : slotEx.inc, slot: slotEx.id, planName: slotEx.name };
+};
+const exForEntry = (workout, e) => {
+  const slotEx = workout.ex.find((x) => x.id === slotOf(e));
+  return slotEx ? resolveEx(slotEx, e.exId) : null;
+};
+// Opções equivalentes pra um slot, sem repetir exercício que já está em outro slot do treino.
+const optionsFor = (slotEx, taken) => {
+  const g = grupoDe(slotEx.id);
+  if (!g) return [];
+  return g.opcoes.map((o) => o.id).filter((id) => id === slotEx.id || !taken.has(id));
+};
+// Exercício efetivo de cada slot de um treino, aplicando as escolhas fixas.
+const chosenIds = (workout, swaps = {}) => {
+  const used = new Set(workout.ex.map((x) => x.id));
+  return workout.ex.map((x) => {
+    const pref = swaps[x.id];
+    if (!pref || pref === x.id || !grupoDe(x.id) || grupoDe(x.id) !== grupoDe(pref) || used.has(pref)) return x.id;
+    used.add(pref);
+    return pref;
+  });
+};
+
 /* ============================ RETORNO APÓS PAUSA ============================ */
 // Faixas, rampa e cargas ficam em ./retorno.js. Aqui só o que depende do plano.
 // Semana onde recomeçar, ancorada na semana do último treino ANTES da pausa — não na
@@ -226,7 +259,7 @@ function recomputePerf(sessions, base = {}) {
   for (const s of asc) {
     const w = findWorkout(s.workoutId); if (!w) continue;
     s.entries.forEach((e) => {
-      const ex = w.ex.find((x) => x.id === e.exId); if (!ex) return;
+      const ex = exForEntry(w, e); if (!ex) return;
       if (e.completed === false) return; // treino novo não realizado; histórico antigo não é afetado
       const reps = e.sets.map((st) => +st.reps || 0);
       const weight = ex.type === "time" ? 0 : (e.sets[0]?.weight || 0);
@@ -296,6 +329,26 @@ function ExInfoSheet({ exId, exName, onClose }) {
   );
 }
 
+// Setas ‹ › pra trocar o exercício por um equivalente.
+function SwapArrows({ options, current, onPick, children }) {
+  const n = options.length;
+  const idx = Math.max(0, options.indexOf(current));
+  if (n < 2) return children;
+  const go = (dir) => onPick(options[(idx + dir + n) % n]);
+  return (
+    <div className="swap">
+      <button className="swapBtn" onClick={() => go(-1)} aria-label="Exercício equivalente anterior"><ChevronLeft size={16} /></button>
+      <div className="swapBody">
+        {children}
+        <span className="swapDots" aria-hidden="true">
+          {options.map((o, k) => <span key={o} className={"swapDot" + (k === idx ? " swapDotOn" : "")} />)}
+        </span>
+      </div>
+      <button className="swapBtn" onClick={() => go(1)} aria-label="Próximo exercício equivalente"><ChevronRight size={16} /></button>
+    </div>
+  );
+}
+
 function Stepper({ value, onChange, step = 2.5, min = 0, suffix }) {
   const dec = () => onChange(Math.max(min, +(value - step).toFixed(2)));
   const inc = () => onChange(+(value + step).toFixed(2));
@@ -359,7 +412,7 @@ function RestTimer({ onClose }) {
 export default function App() {
   const [view, setView] = useState("home");
   const [week, setWeek] = useState(1);
-  const [log, setLog] = useState({ sessions: [], perf: {}, incs: {} });
+  const [log, setLog] = useState({ sessions: [], perf: {}, incs: {}, swaps: {} });
   const [loading, setLoading] = useState(true);
   const [active, setActive] = useState(null); // { workout, entries }
   const [showTimer, setShowTimer] = useState(false);
@@ -375,6 +428,7 @@ export default function App() {
       const s = await loadKey(KEY_STATE, { week: 1 });
       const l = await loadKey(KEY_LOG, { sessions: [], perf: {}, incs: {} });
       if (!l.incs) l.incs = {};
+      if (!l.swaps) l.swaps = {};
       // Migração: garante que toda sessão tenha um id para poder ser reaberta/editada.
       let changed = false;
       l.sessions = (l.sessions || []).map((sess, i) => {
@@ -458,6 +512,43 @@ export default function App() {
     });
   };
 
+  // Escolha fixa de equivalente: vale pra todo treino do plano que tenha esse exercício.
+  const setSwapPref = (slotId, exId) => {
+    setLog((l) => {
+      const swaps = { ...(l.swaps || {}) };
+      if (exId === slotId) delete swaps[slotId]; else swaps[slotId] = exId;
+      const next = { ...l, swaps };
+      saveKey(KEY_LOG, next);
+      return next;
+    });
+  };
+
+  // Séries iniciais de um exercício: progressão normal ou rampa de retorno.
+  const buildSets = (ex, stage, nSetsOverride) => {
+    const last = log.perf[ex.id];
+    let nSets = ex.sets, startWeight, startSecs;
+    if (stage && comeback) {
+      // Rampa de retorno: carga em % do registro de antes da pausa e menos séries no começo.
+      // Sem subir carga por "bateu o topo" — quem manda é a rampa.
+      const cutoff = new Date(comeback.lastBefore.date);
+      const ref = comeback.ref[ex.id];
+      const recent = last && new Date(last.date) > cutoff ? last : null; // já feito dentro da rampa
+      nSets = setsForStage(ex.sets, stage.sets);
+      startWeight = comebackWeight({ refWeight: ref?.weight, recentWeight: recent?.weight, load: stage.load, inc: getInc(ex) });
+      startSecs = comebackSeconds({ refSecs: ref?.reps?.[0], recentSecs: recent?.reps?.[0], load: stage.load });
+    } else {
+      const baseWeight = last ? last.weight : 0;
+      const suggestUp = last && last.top; // bateu topo em todas → sobe carga
+      startWeight = suggestUp ? +(baseWeight + getInc(ex)).toFixed(2) : baseWeight;
+      startSecs = last ? last.reps[0] || 30 : 30;
+    }
+    return Array.from({ length: nSetsOverride || nSets }, () => ({
+      weight: ex.type === "time" ? 0 : startWeight,
+      reps: ex.type === "time" ? startSecs : ex.min,
+      done: false,
+    }));
+  };
+
   /* ---- rascunho: salva o treino em andamento a cada alteração, pra sobreviver ao fechar o app ---- */
   useEffect(() => {
     if (loading) return;
@@ -471,38 +562,18 @@ export default function App() {
   /* ---- iniciar treino ---- */
   const startWorkout = (workout) => {
     const stage = activeStage;
-    const cutoff = comeback ? new Date(comeback.lastBefore.date) : null;
-    const entries = workout.ex.map((ex) => {
-      const last = log.perf[ex.id];
-      let nSets = ex.sets, startWeight, startSecs;
-      if (stage) {
-        // Rampa de retorno: carga em % do registro de antes da pausa e menos séries no começo.
-        // Sem subir carga por "bateu o topo" — quem manda é a rampa.
-        const ref = comeback.ref[ex.id];
-        const recent = last && new Date(last.date) > cutoff ? last : null; // já feito dentro da rampa
-        nSets = setsForStage(ex.sets, stage.sets);
-        startWeight = comebackWeight({ refWeight: ref?.weight, recentWeight: recent?.weight, load: stage.load, inc: getInc(ex) });
-        startSecs = comebackSeconds({ refSecs: ref?.reps?.[0], recentSecs: recent?.reps?.[0], load: stage.load });
-      } else {
-        const baseWeight = last ? last.weight : 0;
-        const suggestUp = last && last.top; // bateu topo em todas → sobe carga
-        startWeight = suggestUp ? +(baseWeight + getInc(ex)).toFixed(2) : baseWeight;
-        startSecs = last ? last.reps[0] || 30 : 30;
-      }
-      return {
-        exId: ex.id,
-        sets: Array.from({ length: nSets }, () => ({
-          weight: ex.type === "time" ? 0 : startWeight,
-          reps: ex.type === "time" ? startSecs : ex.min,
-          done: false,
-        })),
-      };
-    });
+    const ids = chosenIds(workout, log.swaps);
+    const exs = workout.ex.map((slotEx, i) => resolveEx(slotEx, ids[i]));
+    const entries = exs.map((ex) => ({
+      exId: ex.id,
+      ...(ex.id !== ex.slot ? { slot: ex.slot } : {}),
+      sets: buildSets(ex, stage),
+    }));
     // Guarda no treino o que a sessão precisa mostrar (etapa e referência de antes da pausa),
     // pra continuar certo mesmo se o rascunho for recuperado depois.
     const cb = stage ? {
       tier: comeback.tier.id, n: comeback.done + 1, total: comeback.total, ...stage,
-      ref: Object.fromEntries(workout.ex.filter((ex) => comeback.ref[ex.id]).map((ex) => {
+      ref: Object.fromEntries(exs.filter((ex) => comeback.ref[ex.id]).map((ex) => {
         const r = comeback.ref[ex.id];
         return [ex.id, { weight: r.weight, reps: r.reps }];
       })),
@@ -519,7 +590,7 @@ export default function App() {
     if (!workout) { window.alert("Não encontrei esse treino no plano atual — talvez a divisão tenha mudado."); return; }
     let entries;
     if (Array.isArray(session.entries)) {
-      entries = session.entries.map((e) => ({ exId: e.exId, sets: e.sets.map((s) => ({ ...s })) }));
+      entries = session.entries.map((e) => ({ exId: e.exId, ...(e.slot ? { slot: e.slot } : {}), sets: e.sets.map((s) => ({ ...s })) }));
     } else {
       // Sessão antiga (sem séries salvas): remonta a partir do template + último registro para você corrigir.
       entries = workout.ex.map((ex) => {
@@ -544,6 +615,30 @@ export default function App() {
     if (!ymd) return;
     const max = todayYmd();
     setActive((a) => (a ? { ...a, date: ymd > max ? max : ymd } : a));
+  };
+
+  // Troca o exercício de um slot por um equivalente. Se nenhuma série foi marcada, recalcula
+  // as cargas sugeridas pro exercício novo; se já tem série feita, mantém o que foi anotado
+  // (você só esqueceu de trocar antes). No treino novo a escolha vira padrão do plano;
+  // editando um treino antigo, só corrige aquele registro.
+  const swapExercise = (exIdx, nextId) => {
+    const a = active;
+    const entry = a.entries[exIdx];
+    const slotEx = a.workout.ex.find((x) => x.id === slotOf(entry));
+    if (!slotEx || nextId === entry.exId) return;
+    const ex = resolveEx(slotEx, nextId);
+    const keep = a.editingId || entry.sets.some((st) => st.done);
+    const sets = keep
+      ? entry.sets.map((st) => ({ ...st }))
+      : buildSets(ex, a.comeback ? { sets: a.comeback.sets, load: a.comeback.load } : null, entry.sets.length);
+    const newEntry = { exId: nextId, ...(nextId !== slotEx.id ? { slot: slotEx.id } : {}), sets };
+    let cb = a.comeback;
+    if (cb && comeback && comeback.ref[nextId] && !cb.ref[nextId]) {
+      const r = comeback.ref[nextId];
+      cb = { ...cb, ref: { ...cb.ref, [nextId]: { weight: r.weight, reps: r.reps } } };
+    }
+    setActive({ ...a, comeback: cb, entries: a.entries.map((e, k) => (k === exIdx ? newEntry : e)) });
+    if (!a.editingId) setSwapPref(slotEx.id, nextId);
   };
 
   const updateSet = (exIdx, setIdx, field, val) => {
@@ -581,7 +676,7 @@ export default function App() {
     // (Quem fez pelo menos 1 série conta como realizado, mesmo que não tenha completado todas.)
     const notPerformedNames = entries
       .filter((e) => !e.sets.some((s) => s.done))
-      .map((e) => workout.ex.find((x) => x.id === e.exId)?.name)
+      .map((e) => exForEntry(workout, e)?.name)
       .filter(Boolean);
 
     const baseMsg = notPerformedNames.length > 0
@@ -596,7 +691,7 @@ export default function App() {
     const cb = editing ? null : active.comeback;
     let prs = 0;
     entries.forEach((e) => {
-      const ex = workout.ex.find((x) => x.id === e.exId);
+      const ex = exForEntry(workout, e);
       if (!ex || ex.type === "time" || !e.sets.some((s) => s.done)) return;
       const reps = e.sets.map((s) => +s.reps || 0);
       const weight = e.sets[0]?.weight || 0;
@@ -605,13 +700,14 @@ export default function App() {
     });
 
     const volume = entries.reduce((tot, e) => {
-      const ex = workout.ex.find((x) => x.id === e.exId);
+      const ex = exForEntry(workout, e);
       if (!ex || ex.type === "time") return tot;
       return tot + e.sets.reduce((s, set) => s + (+set.weight || 0) * (+set.reps || 0), 0);
     }, 0);
 
     const cleanEntries = entries.map((e) => ({
       exId: e.exId,
+      ...(slotOf(e) !== e.exId ? { slot: slotOf(e) } : {}),
       completed: e.sets.some((s) => s.done),
       sets: e.sets.map((s) => ({ weight: +s.weight || 0, reps: +s.reps || 0, done: !!s.done })),
     }));
@@ -659,13 +755,13 @@ export default function App() {
     if (!w) return [];
     return s.entries
       .filter((e) => e.completed === false)
-      .map((e) => w.ex.find((x) => x.id === e.exId)?.name)
+      .map((e) => exForEntry(w, e)?.name)
       .filter(Boolean);
   };
 
   const resetAll = async () => {
     if (!window.confirm("Apagar todo o histórico e recomeçar? Isso não pode ser desfeito.")) return;
-    const empty = { sessions: [], perf: {}, incs: log.incs || {} };
+    const empty = { sessions: [], perf: {}, incs: log.incs || {}, swaps: log.swaps || {} };
     setLog(empty); await saveKey(KEY_LOG, empty);
     changeWeek(1);
   };
@@ -701,7 +797,8 @@ export default function App() {
 
       const incs = { ...(log.incs || {}), ...(incoming.incs || {}) };
       const perf = recomputePerf(sessions, { ...(log.perf || {}), ...(incoming.perf || {}) });
-      const next = { sessions, perf, incs };
+      const swaps = { ...(log.swaps || {}), ...(incoming.swaps || {}) };
+      const next = { sessions, perf, incs, swaps };
       setLog(next); await saveKey(KEY_LOG, next);
       if (data.state && data.state.week) changeWeek(data.state.week);
       window.alert(`Backup importado. Total: ${sessions.length} treino${sessions.length > 1 ? "s" : ""}.`);
@@ -906,7 +1003,12 @@ export default function App() {
           )}
 
           <div className="exList">
-            {active.workout.ex.map((ex, i) => {
+            {active.entries.map((entry, i) => {
+              const ex = exForEntry(active.workout, entry);
+              if (!ex) return null;
+              const slotEx = active.workout.ex.find((x) => x.id === ex.slot);
+              const taken = new Set(active.entries.filter((_, k) => k !== i).flatMap((e) => [e.exId, slotOf(e)]));
+              const swapOpts = optionsFor(slotEx, taken);
               const last = log.perf[ex.id];
               const suggestUp = last && last.top;
               const nSets = active.entries[i].sets.length;
@@ -914,8 +1016,11 @@ export default function App() {
               return (
                 <div key={ex.id + i} className="exCard">
                   <div className="exHead">
-                    <div>
-                      <div className="exName">{ex.name}</div>
+                    <div className="exHeadMain">
+                      <SwapArrows options={swapOpts} current={ex.id} onPick={(id) => swapExercise(i, id)}>
+                        <div className="exName">{ex.name}</div>
+                      </SwapArrows>
+                      {ex.planName && <div className="exPlanned">no plano: {ex.planName}</div>}
                       <div className="exTarget">
                         {ex.type === "time" ? `${nSets} × tempo` : `${nSets} × ${ex.min}–${ex.max} reps`}
                         {nSets !== ex.sets ? ` (plano: ${ex.sets})` : ""}
@@ -1079,6 +1184,7 @@ export default function App() {
         <main className="wrap">
           <h1 className="pageTitle">O plano completo</h1>
           <p className="planIntro">16 semanas em 4 fases. Progressão por <b>dupla progressão</b>: suba reps dentro da faixa; ao bater o topo em todas as séries, aumente a carga.</p>
+          <p className="planIntro">As setas <b>‹ ›</b> trocam um exercício por um equivalente (mesmo músculo, mesmo padrão de movimento). A troca vale pra todos os treinos do plano que usam aquele exercício. Dá pra trocar também durante o treino.</p>
           {PHASES.map((p) => (
             <div key={p.id} className="planPhase">
               <div className="planPhaseHead">
@@ -1096,18 +1202,35 @@ export default function App() {
                 <div key={w.id} className="planWorkout">
                   <div className="planWorkoutName">{w.name} <span>· {w.tag}</span></div>
                   <div className="planExList">
-                    {w.ex.map((ex) => (
-                      <div key={ex.id} className="planExRow">
-                        {EXERCICIOS_INFO[ex.id] ? (
-                          <button className="planExName planExLink" onClick={() => setInfoEx({ id: ex.id, name: ex.name })}>
-                            {ex.name} <Info size={12} />
-                          </button>
-                        ) : (
-                          <span className="planExName">{ex.name}</span>
-                        )}
-                        <span className="planExScheme">{ex.type === "time" ? `${ex.sets} × tempo` : `${ex.sets} × ${ex.min}–${ex.max}`}</span>
-                      </div>
-                    ))}
+                    {(() => {
+                      const ids = chosenIds(w, log.swaps);
+                      return w.ex.map((slotEx, k) => {
+                        const ex = resolveEx(slotEx, ids[k]);
+                        const taken = new Set(w.ex.flatMap((x, j) => (j === k ? [] : [x.id, ids[j]])));
+                        return (
+                          <div key={slotEx.id} className="planExRow">
+                            <div className="planExMain">
+                              <div className="planExNameRow">
+                                {EXERCICIOS_INFO[ex.id] ? (
+                                  <button className="planExName planExLink" onClick={() => setInfoEx({ id: ex.id, name: ex.name })}>
+                                    {ex.name} <Info size={12} />
+                                  </button>
+                                ) : (
+                                  <span className="planExName">{ex.name}</span>
+                                )}
+                                {optionsFor(slotEx, taken).length > 1 && (
+                                  <span className="planSwap">
+                                    <SwapArrows options={optionsFor(slotEx, taken)} current={ex.id} onPick={(id) => setSwapPref(slotEx.id, id)}>{null}</SwapArrows>
+                                  </span>
+                                )}
+                              </div>
+                              {ex.planName && <span className="planExOrig">no lugar de {ex.planName}</span>}
+                            </div>
+                            <span className="planExScheme">{ex.type === "time" ? `${ex.sets} × tempo` : `${ex.sets} × ${ex.min}–${ex.max}`}</span>
+                          </div>
+                        );
+                      });
+                    })()}
                   </div>
                 </div>
               ))}
@@ -1308,7 +1431,23 @@ const CSS = `
 
 .exList{display:flex;flex-direction:column;gap:14px;}
 .exCard{background:var(--surface);border:1px solid var(--line);border-radius:16px;padding:15px;}
-.exHead{margin-bottom:8px;}
+.exHead{margin-bottom:8px;display:flex;align-items:flex-start;justify-content:space-between;gap:10px;}
+.exHeadMain{flex:1;min-width:0;}
+.exPlanned{font-size:11.5px;color:var(--ember);margin-top:3px;}
+.swap{display:flex;align-items:center;gap:6px;}
+.swapBody{flex:1;min-width:0;display:flex;flex-direction:column;align-items:flex-start;gap:5px;}
+.swapBody:empty,.planSwap .swapBody{display:none;}
+.swapBtn{flex:0 0 auto;width:30px;height:30px;border:1px solid var(--line);background:var(--surface2);color:var(--steel);
+  border-radius:9px;display:grid;place-items:center;cursor:pointer;transition:.15s;padding:0;}
+.swapBtn:hover{color:var(--text);border-color:var(--steel);}
+.swapDots{display:flex;gap:4px;}
+.swapDot{width:5px;height:5px;border-radius:50%;background:var(--line);}
+.swapDotOn{background:var(--steel);}
+.planExMain{min-width:0;display:flex;flex-direction:column;gap:2px;}
+.planExNameRow{display:flex;align-items:center;gap:8px;flex-wrap:wrap;}
+.planSwap .swap{gap:4px;}
+.planSwap .swapBtn{width:24px;height:24px;border-radius:7px;}
+.planExOrig{font-size:11px;color:var(--ember);}
 .exName{font-weight:600;font-size:16px;}
 .exTarget{font-size:12px;color:var(--muted);margin-top:3px;line-height:1.4;}
 .exHint{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--muted);background:var(--surface2);border:1px solid var(--line);border-radius:9px;padding:7px 10px;margin-bottom:11px;display:flex;align-items:center;gap:6px;}
